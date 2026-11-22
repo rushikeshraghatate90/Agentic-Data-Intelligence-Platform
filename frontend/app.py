@@ -286,7 +286,10 @@ st.markdown(
 # APPLICATION CONFIGURATION
 # ============================================================
 
-API_URL = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
+API_URL = os.getenv(
+    "API_URL",
+    "https://agentic-data-intelligence-platform.onrender.com"
+).rstrip("/")
 API_TIMEOUT = 10
 AGENT_TIMEOUT = 120
 
