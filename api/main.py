@@ -1,4 +1,5 @@
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,13 @@ from utils.database import DatabaseUtil
 # ==================================================
 # APPLICATION CONFIGURATION
 # ==================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+
+logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -185,7 +193,6 @@ def get_database_metadata():
     """
 
     try:
-
         database = DatabaseUtil.from_env()
 
         metadata = database.get_database_metadata(
@@ -195,20 +202,19 @@ def get_database_metadata():
         return metadata
 
     except ValueError as error:
-
         raise HTTPException(
             status_code=500,
             detail=str(error),
         ) from error
 
     except RuntimeError as error:
-
         raise HTTPException(
             status_code=503,
             detail="Unable to retrieve database metadata.",
         ) from error
 
     except Exception as error:
+        logger.exception("Unexpected database metadata error")
 
         raise HTTPException(
             status_code=500,
@@ -235,7 +241,6 @@ def list_generated_files():
     files = []
 
     try:
-
         for folder_name, directory in OUTPUT_DIRECTORIES.items():
 
             if not directory.exists():
@@ -246,7 +251,6 @@ def list_generated_files():
             for file_path in directory.glob("*.csv"):
 
                 try:
-
                     resolved_file = file_path.resolve(strict=True)
 
                     # Prevent symlink escapes.
@@ -289,6 +293,7 @@ def list_generated_files():
         }
 
     except OSError as error:
+        logger.exception("Unable to list generated files")
 
         raise HTTPException(
             status_code=500,
@@ -324,9 +329,18 @@ def download_generated_file(file_id: str):
 
 @app.post("/ask", response_model=AgentResponse)
 def ask_agent(request: AgentRequest):
+    """
+    Execute the main multi-agent workflow.
+
+    Logs the complete traceback when agent execution fails.
+    """
+
+    logger.info(
+        "Received agent request: %s",
+        request.question,
+    )
 
     try:
-
         # Execute the main Data Agent.
         response = data_agent.invoke({
             "messages": [
@@ -346,13 +360,11 @@ def ask_agent(request: AgentRequest):
         for message in reversed(
             response.get("messages", [])
         ):
-
             if isinstance(message, AIMessage):
                 final_message = message
                 break
 
         if final_message is None:
-
             raise ValueError(
                 "The agent did not return an assistant message."
             )
@@ -364,7 +376,6 @@ def ask_agent(request: AgentRequest):
             answer = str(answer)
 
         if not answer.strip():
-
             answer = (
                 "The agent completed without returning an answer."
             )
@@ -401,6 +412,11 @@ def ask_agent(request: AgentRequest):
             if key in message_metadata
         }
 
+        logger.info(
+            "Agent execution completed successfully. Route: %s",
+            route,
+        )
+
         return AgentResponse(
             question=request.question,
             route=route,
@@ -412,6 +428,8 @@ def ask_agent(request: AgentRequest):
         )
 
     except Exception as error:
+        # Record the full exception traceback in Render logs.
+        logger.exception("Agent execution failed")
 
         raise HTTPException(
             status_code=500,
