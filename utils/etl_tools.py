@@ -1,6 +1,8 @@
 
+import io
 import json
 import logging
+import os
 import re
 from contextlib import closing
 from pathlib import Path
@@ -10,6 +12,9 @@ import pandas as pd
 import requests
 from psycopg2 import sql
 from psycopg2.extras import execute_values
+
+from dotenv import load_dotenv
+from supabase import Client, create_client
 
 from utils.database import DatabaseUtil
 
@@ -49,8 +54,76 @@ class ETLTools:
     MAX_PREVIEW_ROWS = 20
     MAX_UPLOAD_ROWS = 10000
 
-    def __init__(self):
+    STORAGE_BUCKET = "etl-files"
+
+    def __init__(self, storage_backend: str | None = None):
+        # Load local .env values without overwriting variables supplied by Render.
+        load_dotenv(self.project_root_env_path(), override=False)
         self.project_root = Path(__file__).resolve().parent.parent
+
+        backend = storage_backend or os.getenv("ETL_STORAGE_BACKEND", "local")
+        backend = backend.strip().lower()
+        if backend not in {"local", "supabase"}:
+            raise ValueError("ETL_STORAGE_BACKEND must be 'local' or 'supabase'.")
+
+        self.storage_backend = backend
+        self._supabase: Client | None = None
+
+    @staticmethod
+    def project_root_env_path() -> Path:
+        """Return the project-root .env path without exposing its contents."""
+        return Path(__file__).resolve().parent.parent / ".env"
+
+    def _get_supabase_client(self) -> Client:
+        """Create the Supabase client lazily, only when cloud storage is used."""
+        if self._supabase is not None:
+            return self._supabase
+
+        supabase_url = os.getenv("SUPABASE_URL")
+        supabase_key = os.getenv("SUPABASE_SECRET_KEY")
+        if not supabase_url or not supabase_key:
+            raise RuntimeError(
+                "Supabase Storage requires SUPABASE_URL and SUPABASE_SECRET_KEY."
+            )
+
+        self._supabase = create_client(supabase_url, supabase_key)
+        return self._supabase
+
+    def _storage_object_path(self, project_relative_path: str) -> str:
+        """Validate and normalize a project-relative path for Storage."""
+        resolved = self._resolve_project_path(project_relative_path)
+        return resolved.relative_to(self.project_root).as_posix()
+
+    @staticmethod
+    def _serialize_dataframe(df: pd.DataFrame, output_format: str) -> bytes:
+        """Serialize a DataFrame to bytes for a Supabase Storage upload."""
+        buffer = io.BytesIO()
+        if output_format == "csv":
+            return df.to_csv(index=False).encode("utf-8")
+        if output_format == "json":
+            return df.to_json(
+                orient="records", lines=True, date_format="iso"
+            ).encode("utf-8")
+        if output_format == "parquet":
+            df.to_parquet(buffer, index=False)
+            return buffer.getvalue()
+        raise ValueError(f"Unsupported output format: {output_format}")
+
+    @staticmethod
+    def _dataframe_from_bytes(content: bytes, extension: str) -> pd.DataFrame:
+        """Deserialize CSV, JSON or Parquet content downloaded from Storage."""
+        buffer = io.BytesIO(content)
+        if extension == ".csv":
+            return pd.read_csv(buffer)
+        if extension == ".json":
+            try:
+                return pd.read_json(buffer, lines=True)
+            except ValueError:
+                buffer.seek(0)
+                return pd.read_json(buffer)
+        if extension == ".parquet":
+            return pd.read_parquet(buffer)
+        raise ValueError(f"Unsupported input file format: {extension}")
 
     # ==============================================================
     # PATH VALIDATION
@@ -160,24 +233,39 @@ class ETLTools:
             raise ValueError("Invalid output filename.")
 
         output_path = self._resolve_project_path(output_folder)
-        output_path.mkdir(parents=True, exist_ok=True)
-
         file_path = output_path / f"{filename}.{output_format}"
 
-        if output_format == "csv":
-            df.to_csv(file_path, index=False)
+        if self.storage_backend == "local":
+            output_path.mkdir(parents=True, exist_ok=True)
+            if output_format == "csv":
+                df.to_csv(file_path, index=False)
+            elif output_format == "json":
+                df.to_json(
+                    file_path,
+                    orient="records",
+                    lines=True,
+                    date_format="iso",
+                )
+            else:
+                df.to_parquet(file_path, index=False)
+            return file_path
 
-        elif output_format == "json":
-            df.to_json(
-                file_path,
-                orient="records",
-                lines=True,
-                date_format="iso",
-            )
-
-        elif output_format == "parquet":
-            df.to_parquet(file_path, index=False)
-
+        object_path = self._storage_object_path(file_path.relative_to(self.project_root).as_posix())
+        content = self._serialize_dataframe(df, output_format)
+        content_types = {
+            "csv": "text/csv",
+            "json": "application/x-ndjson",
+            "parquet": "application/octet-stream",
+        }
+        self._get_supabase_client().storage.from_(self.STORAGE_BUCKET).upload(
+            object_path,
+            content,
+            file_options={
+                "content-type": content_types[output_format],
+                "upsert": "true",
+            },
+        )
+        # Return the logical project path for compatibility with existing callers.
         return file_path
 
     # ==============================================================
@@ -545,32 +633,43 @@ class ETLTools:
         """Read CSV, JSON or Parquet files from the project directory."""
 
         path = self._resolve_project_path(file_path)
-
-        if not path.exists() or not path.is_file():
-            raise FileNotFoundError(
-                f"Input file not found: {file_path}"
-            )
-
         extension = path.suffix.lower()
 
-        if extension == ".csv":
-            df = pd.read_csv(path)
-
-        elif extension == ".json":
-            try:
-                df = pd.read_json(path, lines=True)
-            except ValueError:
-                df = pd.read_json(path)
-
-        elif extension == ".parquet":
-            df = pd.read_parquet(path)
-
-        else:
+        if extension not in {".csv", ".json", ".parquet"}:
             raise ValueError(
                 f"Unsupported input file format: {extension}"
             )
 
-        return df
+        if self.storage_backend == "local":
+            if not path.exists() or not path.is_file():
+                raise FileNotFoundError(
+                    f"Input file not found: {file_path}"
+                )
+            if extension == ".csv":
+                return pd.read_csv(path)
+            if extension == ".json":
+                try:
+                    return pd.read_json(path, lines=True)
+                except ValueError:
+                    return pd.read_json(path)
+            return pd.read_parquet(path)
+
+        object_path = path.relative_to(self.project_root).as_posix()
+        try:
+            content = self._get_supabase_client().storage.from_(
+                self.STORAGE_BUCKET
+            ).download(object_path)
+        except Exception as error:
+            message = str(error).lower()
+            if "not found" in message or "404" in message:
+                raise FileNotFoundError(
+                    f"Input file not found in Supabase Storage: {file_path}"
+                ) from error
+            raise
+
+        if not isinstance(content, bytes):
+            content = bytes(content)
+        return self._dataframe_from_bytes(content, extension)
 
     # ==============================================================
     # TRANSFORMATION CONTEXT
@@ -850,67 +949,63 @@ class ETLTools:
     # ==============================================================
 
     def list_generated_files(self) -> str:
-        """List generated CSV files in approved ETL output folders."""
+        """List generated CSV files from local storage or Supabase Storage."""
 
         generated_files = []
-
-        allowed_folders = (
-            "data/extract",
-            "data/transform",
-        )
+        allowed_folders = ("data/extract", "data/transform")
 
         try:
-            for folder_name in allowed_folders:
-
-                expected_folder = self.project_root / folder_name
-
-                if expected_folder.is_symlink():
-                    continue
-
-                folder = self._resolve_project_path(folder_name)
-
-                if not folder.exists() or not folder.is_dir():
-                    continue
-
-                for file_path in sorted(folder.iterdir()):
-
-                    if file_path.suffix.lower() != ".csv":
+            if self.storage_backend == "supabase":
+                bucket = self._get_supabase_client().storage.from_(
+                    self.STORAGE_BUCKET
+                )
+                for folder_name in allowed_folders:
+                    entries = bucket.list(folder_name)
+                    for entry in entries or []:
+                        name = entry.get("name") if isinstance(entry, dict) else None
+                        if not name or not name.lower().endswith(".csv"):
+                            continue
+                        metadata = entry.get("metadata") or {}
+                        object_path = f"{folder_name}/{name}"
+                        generated_files.append({
+                            "filename": name,
+                            "folder": folder_name,
+                            "path": object_path,
+                            "size_bytes": metadata.get("size") or entry.get("size"),
+                        })
+            else:
+                for folder_name in allowed_folders:
+                    expected_folder = self.project_root / folder_name
+                    if expected_folder.is_symlink():
                         continue
-
-                    if file_path.is_symlink():
+                    folder = self._resolve_project_path(folder_name)
+                    if not folder.exists() or not folder.is_dir():
                         continue
-
-                    resolved_file = file_path.resolve()
-
-                    if not resolved_file.is_relative_to(folder):
-                        continue
-
-                    if not resolved_file.is_file():
-                        continue
-
-                    generated_files.append({
-                        "filename": resolved_file.name,
-                        "folder": folder_name,
-                        "path": resolved_file.relative_to(
-                            self.project_root
-                        ).as_posix(),
-                        "size_bytes": resolved_file.stat().st_size,
-                    })
+                    for file_path in sorted(folder.iterdir()):
+                        if file_path.suffix.lower() != ".csv" or file_path.is_symlink():
+                            continue
+                        resolved_file = file_path.resolve()
+                        if not resolved_file.is_relative_to(folder) or not resolved_file.is_file():
+                            continue
+                        generated_files.append({
+                            "filename": resolved_file.name,
+                            "folder": folder_name,
+                            "path": resolved_file.relative_to(self.project_root).as_posix(),
+                            "size_bytes": resolved_file.stat().st_size,
+                        })
 
             if not generated_files:
                 return "No generated CSV files were found."
 
             return json.dumps(
-                {
-                    "total_files": len(generated_files),
-                    "files": generated_files,
-                },
+                {"total_files": len(generated_files), "files": generated_files},
                 indent=2,
             )
 
-        except (OSError, ValueError) as error:
+        except Exception as error:
             logger.exception("Unable to list generated files")
             return f"Unable to list generated files: {error}"
+
 
 
 # ==============================================================

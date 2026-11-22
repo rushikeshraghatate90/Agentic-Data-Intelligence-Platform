@@ -9,7 +9,8 @@ from utils.etl_tools import ETLTools
 @pytest.fixture
 def etl(tmp_path):
     """Create an ETL instance using an isolated temporary project directory."""
-    instance = ETLTools()
+    # Unit tests must stay isolated from external Supabase Storage.
+    instance = ETLTools(storage_backend="local")
     instance.project_root = tmp_path
     return instance
 
