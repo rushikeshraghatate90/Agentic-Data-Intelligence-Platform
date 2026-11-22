@@ -1,0 +1,28 @@
+
+# Virtual environments
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+
+# Generated ETL files
+extraction/
+data/extract/*.csv
+data/transform/*.csv
+
+# Local backups
+agents/sql_analyst_backup.py
+
+# Git
+.git/
