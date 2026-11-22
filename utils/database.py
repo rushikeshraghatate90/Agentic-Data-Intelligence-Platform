@@ -2,14 +2,12 @@
 import json
 import os
 from contextlib import closing
+from pathlib import Path
 from typing import Any
 
 import psycopg2
-from psycopg2 import sql
 from dotenv import load_dotenv
-
-
-load_dotenv()
+from psycopg2 import sql
 
 
 class DatabaseUtil:
@@ -17,13 +15,14 @@ class DatabaseUtil:
     PostgreSQL database utility.
 
     Features:
-    - Environment-based database configuration
-    - Managed database connections
+    - Explicit environment configuration
+    - Project-root .env loading
+    - Managed PostgreSQL connections
     - Database schema inspection
     - Structured database metadata
     - Live table row counts
     - Optional sample data retrieval
-    - Read-only SQL query execution
+    - Read-only SQL execution
     - Query timeout
     - Maximum result row limit
     """
@@ -38,8 +37,25 @@ class DatabaseUtil:
     @classmethod
     def from_env(cls):
         """
-        Load PostgreSQL configuration from environment variables.
+        Load PostgreSQL configuration.
+
+        Local:
+            Loads .env from the project root.
+            The project .env takes priority.
+
+        Production:
+            Uses environment variables configured by the host
+            when no project .env file exists.
         """
+
+        project_root = Path(__file__).resolve().parent.parent
+        env_file = project_root / ".env"
+
+        if env_file.is_file():
+            load_dotenv(
+                dotenv_path=env_file,
+                override=True,
+            )
 
         required_variables = [
             "DB_HOST",
@@ -60,20 +76,28 @@ class DatabaseUtil:
                 + ", ".join(missing_variables)
             )
 
+        try:
+            port = int(os.getenv("DB_PORT", "5432"))
+        except ValueError as error:
+            raise ValueError(
+                "DB_PORT must be a valid integer."
+            ) from error
+
+        if not 1 <= port <= 65535:
+            raise ValueError(
+                "DB_PORT must be between 1 and 65535."
+            )
+
         db_config = {
-            "host": os.getenv("DB_HOST"),
-            "port": int(os.getenv("DB_PORT", "5432")),
-            "user": os.getenv("DB_USER"),
+            "host": os.getenv("DB_HOST", "").strip(),
+            "port": port,
+            "user": os.getenv("DB_USER", "").strip(),
             "password": os.getenv("DB_PASSWORD"),
-            "dbname": os.getenv("DB_NAME"),
+            "dbname": os.getenv("DB_NAME", "").strip(),
             "connect_timeout": 10,
             "application_name": "AI_Data_Agent",
+            "sslmode": os.getenv("DB_SSLMODE", "require").strip(),
         }
-
-        sslmode = os.getenv("DB_SSLMODE")
-
-        if sslmode:
-            db_config["sslmode"] = sslmode
 
         return cls(db_config)
 
@@ -83,20 +107,61 @@ class DatabaseUtil:
 
     def _connect(self, read_only: bool = True):
         """
-        Create a new database connection.
+        Create a PostgreSQL connection.
 
-        Connections are opened for individual operations
-        and closed automatically after execution.
+        read_only=True:
+            Prevents database modifications.
+
+        read_only=False:
+            Allows controlled ETL write operations.
         """
 
         connection = psycopg2.connect(**self.db_config)
 
-        connection.set_session(
-            readonly=read_only,
-            autocommit=False,
-        )
+        try:
+            connection.set_session(
+                readonly=read_only,
+                autocommit=False,
+            )
 
-        return connection
+            return connection
+
+        except Exception:
+            connection.close()
+            raise
+
+    # ---------------------------------------------------------
+    # DATABASE CONNECTION TEST
+    # ---------------------------------------------------------
+
+    def test_connection(self) -> dict[str, Any]:
+        """Verify authentication and basic database connectivity."""
+
+        try:
+            with closing(self._connect()) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT
+                            current_database(),
+                            current_user,
+                            version();
+                        """
+                    )
+
+                    database, user, version = cursor.fetchone()
+
+            return {
+                "success": True,
+                "database": database,
+                "user": user,
+                "server_version": version,
+            }
+
+        except psycopg2.Error as error:
+            raise RuntimeError(
+                f"Database connection failed: {error}"
+            ) from error
 
     # ---------------------------------------------------------
     # SCHEMA DETAILS
@@ -107,12 +172,7 @@ class DatabaseUtil:
         schema_name: str = "public",
         include_samples: bool = False,
     ) -> str:
-        """
-        Retrieve database tables, columns, and data types.
-
-        Sample records are optional to avoid unnecessarily
-        exposing database contents to the LLM.
-        """
+        """Retrieve database tables, columns and data types."""
 
         schema_information = [
             f"Database Schema: {schema_name}"
@@ -120,7 +180,6 @@ class DatabaseUtil:
 
         try:
             with closing(self._connect()) as connection:
-
                 with connection.cursor() as cursor:
 
                     cursor.execute(
@@ -161,14 +220,12 @@ class DatabaseUtil:
                         columns = cursor.fetchall()
 
                         for column_name, data_type in columns:
-
                             schema_information.append(
                                 f"  Column: {column_name}, "
                                 f"Data Type: {data_type}"
                             )
 
                         if include_samples:
-
                             sample_query = sql.SQL(
                                 "SELECT * FROM {}.{} LIMIT 3"
                             ).format(
@@ -177,12 +234,9 @@ class DatabaseUtil:
                             )
 
                             cursor.execute(sample_query)
-
                             sample_rows = cursor.fetchall()
 
-                            schema_information.append(
-                                "  Sample Data:"
-                            )
+                            schema_information.append("  Sample Data:")
 
                             for row in sample_rows:
                                 schema_information.append(
@@ -192,7 +246,6 @@ class DatabaseUtil:
             return "\n".join(schema_information)
 
         except psycopg2.Error as error:
-
             raise RuntimeError(
                 f"Unable to retrieve database schema: {error}"
             ) from error
@@ -205,21 +258,7 @@ class DatabaseUtil:
         self,
         schema_name: str = "public",
     ) -> dict[str, Any]:
-        """
-        Retrieve structured database metadata for the frontend.
-
-        Returns:
-        - Database name
-        - Schema name
-        - Table names
-        - Column names
-        - PostgreSQL data types
-        - Nullable information
-        - Exact live row counts
-        - Total tables and records
-
-        This method only reads database information.
-        """
+        """Retrieve structured database metadata."""
 
         metadata = {
             "database": None,
@@ -231,19 +270,15 @@ class DatabaseUtil:
         }
 
         try:
-
             with closing(self._connect()) as connection:
-
                 with connection.cursor() as cursor:
 
-                    # Get database name.
                     cursor.execute(
                         "SELECT current_database();"
                     )
 
                     metadata["database"] = cursor.fetchone()[0]
 
-                    # Retrieve all base tables.
                     cursor.execute(
                         """
                         SELECT table_name
@@ -259,7 +294,6 @@ class DatabaseUtil:
 
                     for (table_name,) in tables:
 
-                        # Retrieve column information.
                         cursor.execute(
                             """
                             SELECT
@@ -289,7 +323,6 @@ class DatabaseUtil:
                             ) in columns
                         ]
 
-                        # Safely count rows using quoted identifiers.
                         count_query = sql.SQL(
                             "SELECT COUNT(*) FROM {}.{}"
                         ).format(
@@ -298,7 +331,6 @@ class DatabaseUtil:
                         )
 
                         cursor.execute(count_query)
-
                         row_count = cursor.fetchone()[0]
 
                         table_metadata = {
@@ -308,10 +340,7 @@ class DatabaseUtil:
                             "column_count": len(column_details),
                         }
 
-                        metadata["tables"].append(
-                            table_metadata
-                        )
-
+                        metadata["tables"].append(table_metadata)
                         metadata["total_records"] += row_count
 
                     metadata["total_tables"] = len(
@@ -321,7 +350,6 @@ class DatabaseUtil:
             return metadata
 
         except psycopg2.Error as error:
-
             raise RuntimeError(
                 f"Unable to retrieve database metadata: {error}"
             ) from error
@@ -333,27 +361,21 @@ class DatabaseUtil:
     @staticmethod
     def _validate_read_only_query(query: str) -> str:
         """
-        Basic SQL statement validation.
+        Validate read-only SQL.
 
-        PostgreSQL read-only transaction provides an additional
+        PostgreSQL read-only transactions provide an additional
         database-level protection.
         """
 
         if not isinstance(query, str) or not query.strip():
-
-            raise ValueError(
-                "SQL query cannot be empty."
-            )
+            raise ValueError("SQL query cannot be empty.")
 
         query = query.strip()
 
-        # Remove one optional trailing semicolon.
         if query.endswith(";"):
             query = query[:-1].rstrip()
 
-        # Reject multiple SQL statements.
         if ";" in query:
-
             raise ValueError(
                 "Multiple SQL statements are not allowed."
             )
@@ -361,7 +383,6 @@ class DatabaseUtil:
         first_keyword = query.split(None, 1)[0].upper()
 
         if first_keyword not in {"SELECT", "WITH"}:
-
             raise ValueError(
                 "Only SELECT and WITH queries are permitted."
             )
@@ -384,9 +405,8 @@ class DatabaseUtil:
         Protections:
         - SELECT and WITH statement policy
         - Read-only PostgreSQL transaction
-        - Query execution timeout
+        - Query timeout
         - Maximum returned rows
-        - No database modification commits
         """
 
         if (
@@ -394,7 +414,6 @@ class DatabaseUtil:
             or isinstance(max_rows, bool)
             or not 1 <= max_rows <= 1000
         ):
-
             raise ValueError(
                 "max_rows must be an integer between 1 and 1000."
             )
@@ -404,7 +423,6 @@ class DatabaseUtil:
             or isinstance(timeout_ms, bool)
             or not 100 <= timeout_ms <= 60000
         ):
-
             raise ValueError(
                 "timeout_ms must be an integer between 100 and 60000."
             )
@@ -412,22 +430,17 @@ class DatabaseUtil:
         safe_query = self._validate_read_only_query(query)
 
         try:
-
             with closing(self._connect()) as connection:
-
                 with connection.cursor() as cursor:
 
-                    # Set query timeout.
                     cursor.execute(
                         "SET LOCAL statement_timeout = %s",
                         (timeout_ms,),
                     )
 
-                    # Execute the validated query.
-                    cursor.execute(safe_query, ())
+                    cursor.execute(safe_query)
 
                     if cursor.description is None:
-
                         raise ValueError(
                             "The query did not return a result set."
                         )
@@ -437,11 +450,9 @@ class DatabaseUtil:
                         for description in cursor.description
                     ]
 
-                    # Fetch one additional row to detect truncation.
                     rows = cursor.fetchmany(max_rows + 1)
 
                     truncated = len(rows) > max_rows
-
                     rows = rows[:max_rows]
 
                     result = {
@@ -464,7 +475,6 @@ class DatabaseUtil:
             raise
 
         except Exception as error:
-
             raise RuntimeError(
                 f"SQL execution failed: {error}"
             ) from error
@@ -477,21 +487,24 @@ class DatabaseUtil:
 if __name__ == "__main__":
 
     try:
-
         database = DatabaseUtil.from_env()
 
-        # Test 1: Schema details.
+        print("\nDATABASE CONNECTION TEST")
+        print("-" * 50)
+
+        connection_result = database.test_connection()
+        print(json.dumps(connection_result, indent=2))
+
         print("\nDATABASE SCHEMA")
         print("-" * 50)
 
-        schema = database.schema_details(
-            schema_name="public",
-            include_samples=False,
+        print(
+            database.schema_details(
+                schema_name="public",
+                include_samples=False,
+            )
         )
 
-        print(schema)
-
-        # Test 2: Database connection.
         print("\nDATABASE QUERY TEST")
         print("-" * 50)
 
@@ -501,7 +514,6 @@ if __name__ == "__main__":
 
         print(result)
 
-        # Test 3: Live structured metadata.
         print("\nLIVE DATABASE METADATA")
         print("-" * 50)
 
@@ -517,24 +529,14 @@ if __name__ == "__main__":
             )
         )
 
-        # Test 4: Display summary.
         print("\nDATABASE SUMMARY")
         print("-" * 50)
 
-        print(
-            f"Database: {metadata['database']}"
-        )
-
-        print(
-            f"Total Tables: {metadata['total_tables']}"
-        )
-
-        print(
-            f"Total Records: {metadata['total_records']}"
-        )
+        print(f"Database: {metadata['database']}")
+        print(f"Total Tables: {metadata['total_tables']}")
+        print(f"Total Records: {metadata['total_records']}")
 
         for table in metadata["tables"]:
-
             print(
                 f"{table['name']}: "
                 f"{table['row_count']} records, "
@@ -542,5 +544,4 @@ if __name__ == "__main__":
             )
 
     except Exception as error:
-
         print(f"Database test failed: {error}")

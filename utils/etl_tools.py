@@ -1,14 +1,37 @@
 
 import json
+import logging
+import re
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import requests
+from psycopg2 import sql
+from psycopg2.extras import execute_values
+
+from utils.database import DatabaseUtil
+
+
+logger = logging.getLogger(__name__)
 
 
 class ETLTools:
-    """Utilities for extracting, transforming, and loading tabular data."""
+    """
+    ETL utilities for API, PostgreSQL and local file operations.
+
+    EXTRACT:
+        - External HTTP APIs
+        - Supabase PostgreSQL tables
+
+    TRANSFORM:
+        - Validated Pandas transformations
+
+    LOAD:
+        - CSV, JSON and Parquet files
+        - Existing Supabase PostgreSQL tables
+    """
 
     SUPPORTED_FORMATS = {"csv", "json", "parquet"}
 
@@ -22,18 +45,22 @@ class ETLTools:
         "fill_null",
     }
 
+    MAX_EXTRACTION_ROWS = 10000
+    MAX_PREVIEW_ROWS = 20
+    MAX_UPLOAD_ROWS = 10000
+
     def __init__(self):
         self.project_root = Path(__file__).resolve().parent.parent
 
-    # ------------------------------------------------------------------
+    # ==============================================================
     # PATH VALIDATION
-    # ------------------------------------------------------------------
+    # ==============================================================
 
     def _resolve_project_path(self, path: str) -> Path:
-        """
-        Resolve a path and prevent access outside the project directory.
-        Both relative paths and absolute paths inside the project are allowed.
-        """
+        """Resolve a project-relative path safely."""
+
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("A valid project-relative path is required.")
 
         resolved_path = (self.project_root / path).resolve()
 
@@ -44,11 +71,14 @@ class ETLTools:
 
         return resolved_path
 
-    # ------------------------------------------------------------------
+    # ==============================================================
     # FILE FORMAT VALIDATION
-    # ------------------------------------------------------------------
+    # ==============================================================
 
     def _validate_format(self, file_format: str) -> str:
+        if not isinstance(file_format, str):
+            raise ValueError("File format must be a string.")
+
         file_format = file_format.lower().strip()
 
         if file_format not in self.SUPPORTED_FORMATS:
@@ -59,9 +89,59 @@ class ETLTools:
 
         return file_format
 
-    # ------------------------------------------------------------------
+    # ==============================================================
+    # DATABASE IDENTIFIER VALIDATION
+    # ==============================================================
+
+    @staticmethod
+    def _validate_identifier(identifier: str, name: str) -> str:
+        """Validate PostgreSQL identifiers before using them."""
+
+        if not isinstance(identifier, str):
+            raise ValueError(f"{name} must be a string.")
+
+        identifier = identifier.strip()
+
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", identifier):
+            raise ValueError(f"Invalid PostgreSQL {name}: {identifier}")
+
+        return identifier
+
+    def _get_database_columns(
+        self,
+        database: DatabaseUtil,
+        schema_name: str,
+        table_name: str,
+    ) -> list[str]:
+        """Retrieve actual columns from an existing PostgreSQL table."""
+
+        schema_name = self._validate_identifier(schema_name, "schema")
+        table_name = self._validate_identifier(table_name, "table")
+
+        query = """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s
+              AND table_name = %s
+            ORDER BY ordinal_position;
+        """
+
+        with closing(database._connect(read_only=True)) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query, (schema_name, table_name))
+                columns = [row[0] for row in cursor.fetchall()]
+
+        if not columns:
+            raise ValueError(
+                f"Table '{schema_name}.{table_name}' does not exist "
+                "or has no accessible columns."
+            )
+
+        return columns
+
+    # ==============================================================
     # SAVE DATAFRAME
-    # ------------------------------------------------------------------
+    # ==============================================================
 
     def _save_dataframe(
         self,
@@ -70,10 +150,16 @@ class ETLTools:
         output_format: str,
         filename: str,
     ) -> Path:
+        """Save a DataFrame in CSV, JSON or Parquet format."""
 
         output_format = self._validate_format(output_format)
-        output_path = self._resolve_project_path(output_folder)
 
+        if not isinstance(filename, str) or not re.fullmatch(
+            r"[A-Za-z0-9_-]{1,100}", filename
+        ):
+            raise ValueError("Invalid output filename.")
+
+        output_path = self._resolve_project_path(output_folder)
         output_path.mkdir(parents=True, exist_ok=True)
 
         file_path = output_path / f"{filename}.{output_format}"
@@ -86,6 +172,7 @@ class ETLTools:
                 file_path,
                 orient="records",
                 lines=True,
+                date_format="iso",
             )
 
         elif output_format == "parquet":
@@ -93,9 +180,9 @@ class ETLTools:
 
         return file_path
 
-    # ------------------------------------------------------------------
-    # EXTRACT AND LOAD
-    # ------------------------------------------------------------------
+    # ==============================================================
+    # EXTRACT: EXTERNAL API
+    # ==============================================================
 
     def extract_load(
         self,
@@ -103,14 +190,14 @@ class ETLTools:
         output_folder: str,
         format: str,
     ) -> str:
-        """
-        Extract data from an HTTP API and save it as CSV, JSON, or Parquet.
-        """
+        """Extract JSON data from an HTTP API and save it."""
 
         try:
             output_format = self._validate_format(format)
 
-            if not url.startswith(("https://", "http://")):
+            if not isinstance(url, str) or not url.startswith(
+                ("https://", "http://")
+            ):
                 raise ValueError("Only HTTP and HTTPS URLs are supported.")
 
             response = requests.get(
@@ -119,10 +206,8 @@ class ETLTools:
             )
 
             response.raise_for_status()
-
             data = response.json()
 
-            # Handle common API response structures.
             if isinstance(data, dict) and "results" in data:
                 records = data["results"]
 
@@ -153,6 +238,7 @@ class ETLTools:
                 filename="extracted_data",
             )
 
+            # Preserve the existing test and caller response contract.
             return (
                 "Extraction completed successfully.\n"
                 f"Records extracted: {len(df)}\n"
@@ -164,24 +250,306 @@ class ETLTools:
             return "Extraction failed: API request timed out."
 
         except requests.exceptions.RequestException as error:
+            logger.exception("API extraction failed")
             return f"Extraction failed: {error}"
 
         except (ValueError, OSError) as error:
             return f"Extraction failed: {error}"
 
-    # ------------------------------------------------------------------
+    # ==============================================================
+    # EXTRACT: SUPABASE POSTGRESQL
+    # ==============================================================
+
+    def extract_database_to_file(
+        self,
+        table_name: str,
+        output_folder: str = "data/extract",
+        output_format: str = "csv",
+        schema_name: str = "public",
+        limit: int = 100,
+        order_by: str | None = None,
+        ascending: bool = True,
+        columns: list[str] | None = None,
+        filename: str = "database_extract",
+    ) -> str:
+        """
+        Extract records from an existing Supabase PostgreSQL table.
+
+        Only SELECT queries are executed.
+
+        Args:
+            table_name: Existing database table.
+            output_folder: Project-relative output directory.
+            output_format: csv, json or parquet.
+            schema_name: PostgreSQL schema.
+            limit: Maximum number of records.
+            order_by: Optional ordering column.
+            ascending: Sort direction.
+            columns: Optional selected columns.
+            filename: Output filename without extension.
+        """
+
+        try:
+            output_format = self._validate_format(output_format)
+
+            if (
+                not isinstance(limit, int)
+                or isinstance(limit, bool)
+                or not 1 <= limit <= self.MAX_EXTRACTION_ROWS
+            ):
+                raise ValueError(
+                    f"limit must be between 1 and {self.MAX_EXTRACTION_ROWS}."
+                )
+
+            if not isinstance(ascending, bool):
+                raise ValueError("ascending must be a boolean.")
+
+            schema_name = self._validate_identifier(
+                schema_name, "schema"
+            )
+
+            table_name = self._validate_identifier(
+                table_name, "table"
+            )
+
+            database = DatabaseUtil.from_env()
+
+            available_columns = self._get_database_columns(
+                database,
+                schema_name,
+                table_name,
+            )
+
+            selected_columns = (
+                columns if columns is not None else available_columns
+            )
+
+            if not isinstance(selected_columns, list) or not selected_columns:
+                raise ValueError("Provide at least one column to extract.")
+
+            if len(selected_columns) != len(set(selected_columns)):
+                raise ValueError("Duplicate column names are not allowed.")
+
+            for column in selected_columns:
+                if column not in available_columns:
+                    raise ValueError(
+                        f"Unknown column '{column}' in table '{table_name}'."
+                    )
+
+            if order_by is not None and order_by not in available_columns:
+                raise ValueError(f"Unknown ordering column: {order_by}")
+
+            query = sql.SQL("SELECT {} FROM {}.{}").format(
+                sql.SQL(", ").join(
+                    sql.Identifier(column)
+                    for column in selected_columns
+                ),
+                sql.Identifier(schema_name),
+                sql.Identifier(table_name),
+            )
+
+            if order_by:
+                query += sql.SQL(" ORDER BY {} {}").format(
+                    sql.Identifier(order_by),
+                    sql.SQL("ASC" if ascending else "DESC"),
+                )
+
+            query += sql.SQL(" LIMIT %s")
+
+            with closing(database._connect(read_only=True)) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(query, (limit,))
+
+                    records = cursor.fetchall()
+
+                    result_columns = [
+                        description[0]
+                        for description in cursor.description
+                    ]
+
+            df = pd.DataFrame(
+                records,
+                columns=result_columns,
+            )
+
+            if df.empty:
+                return (
+                    f"No records found in {schema_name}.{table_name}."
+                )
+
+            file_path = self._save_dataframe(
+                df=df,
+                output_folder=output_folder,
+                output_format=output_format,
+                filename=filename,
+            )
+
+            relative_path = file_path.relative_to(
+                self.project_root
+            ).as_posix()
+
+            return (
+                "Database extraction completed successfully.\n"
+                "Database: Supabase PostgreSQL\n"
+                f"Table: {schema_name}.{table_name}\n"
+                f"Records extracted: {len(df)}\n"
+                f"Columns extracted: {len(df.columns)}\n"
+                f"Output format: {output_format}\n"
+                f"Saved file: {relative_path}"
+            )
+
+        except Exception as error:
+            logger.exception("Database extraction failed")
+            return f"Database extraction failed: {error}"
+
+    # ==============================================================
+    # LOAD: FILE INTO SUPABASE POSTGRESQL
+    # ==============================================================
+
+    def load_dataframe_to_database(
+        self,
+        input_file_path: str,
+        table_name: str,
+        schema_name: str = "public",
+        if_exists: str = "append",
+        confirm_replace: bool = False,
+    ) -> str:
+        """
+        Load a local dataset into an existing PostgreSQL table.
+
+        append:
+            Insert records without deleting existing data.
+
+        replace:
+            Delete existing records and insert the new records.
+            Requires confirm_replace=True.
+
+        This method never creates or drops tables.
+        """
+
+        try:
+            if if_exists not in {"append", "replace"}:
+                raise ValueError(
+                    "if_exists must be 'append' or 'replace'."
+                )
+
+            if not isinstance(confirm_replace, bool):
+                raise ValueError("confirm_replace must be a boolean.")
+
+            if if_exists == "replace" and confirm_replace is not True:
+                raise ValueError(
+                    "Replacing table data requires confirm_replace=True."
+                )
+
+            schema_name = self._validate_identifier(
+                schema_name, "schema"
+            )
+
+            table_name = self._validate_identifier(
+                table_name, "table"
+            )
+
+            df = self._read_dataframe(input_file_path)
+
+            if df.empty:
+                return "Database loading cancelled: input file is empty."
+
+            if len(df) > self.MAX_UPLOAD_ROWS:
+                raise ValueError(
+                    f"Upload is limited to {self.MAX_UPLOAD_ROWS} rows."
+                )
+
+            if not all(isinstance(column, str) for column in df.columns):
+                raise ValueError("All DataFrame column names must be strings.")
+
+            if len(df.columns) != len(set(df.columns)):
+                raise ValueError("Duplicate DataFrame column names found.")
+
+            database = DatabaseUtil.from_env()
+
+            available_columns = self._get_database_columns(
+                database,
+                schema_name,
+                table_name,
+            )
+
+            missing_columns = [
+                column
+                for column in df.columns
+                if column not in available_columns
+            ]
+
+            if missing_columns:
+                raise ValueError(
+                    "Input contains columns not present in the target table: "
+                    + ", ".join(missing_columns)
+                )
+
+            records = [
+                tuple(
+                    None if pd.isna(value) else value
+                    for value in row
+                )
+                for row in df.itertuples(index=False, name=None)
+            ]
+
+            insert_query = sql.SQL(
+                "INSERT INTO {}.{} ({}) VALUES %s"
+            ).format(
+                sql.Identifier(schema_name),
+                sql.Identifier(table_name),
+                sql.SQL(", ").join(
+                    sql.Identifier(column)
+                    for column in df.columns
+                ),
+            )
+
+            # The connection context commits on success and rolls back
+            # on failure. closing() ensures the connection is closed.
+            with closing(database._connect(read_only=False)) as connection:
+                with connection:
+                    with connection.cursor() as cursor:
+
+                        if if_exists == "replace":
+                            cursor.execute(
+                                sql.SQL("DELETE FROM {}.{}").format(
+                                    sql.Identifier(schema_name),
+                                    sql.Identifier(table_name),
+                                )
+                            )
+
+                        execute_values(
+                            cursor,
+                            insert_query.as_string(connection),
+                            records,
+                            page_size=500,
+                        )
+
+            return (
+                "Database loading completed successfully.\n"
+                f"Target table: {schema_name}.{table_name}\n"
+                f"Records loaded: {len(records)}\n"
+                f"Loading policy: {if_exists}\n"
+                f"Source file: {input_file_path}"
+            )
+
+        except Exception as error:
+            logger.exception("Database loading failed")
+            return f"Database loading failed: {error}"
+
+    # ==============================================================
     # READ INPUT FILE
-    # ------------------------------------------------------------------
+    # ==============================================================
 
     def _read_dataframe(self, file_path: str) -> pd.DataFrame:
-        """
-        Read CSV, JSON, or Parquet files.
-        """
+        """Read CSV, JSON or Parquet files from the project directory."""
 
         path = self._resolve_project_path(file_path)
 
         if not path.exists() or not path.is_file():
-            raise FileNotFoundError(f"Input file not found: {path}")
+            raise FileNotFoundError(
+                f"Input file not found: {file_path}"
+            )
 
         extension = path.suffix.lower()
 
@@ -204,34 +572,31 @@ class ETLTools:
 
         return df
 
-    # ------------------------------------------------------------------
+    # ==============================================================
     # TRANSFORMATION CONTEXT
-    # ------------------------------------------------------------------
+    # ==============================================================
 
     def transform_load_context(self, file_path: str) -> str:
-        """
-        Return column information and sample records for the LLM.
-        """
+        """Return dataset information for the transformation planner."""
 
         try:
             df = self._read_dataframe(file_path)
 
-            context = (
+            return (
                 f"Total rows: {len(df)}\n"
                 f"Total columns: {len(df.columns)}\n\n"
                 f"Column names:\n{list(df.columns)}\n\n"
                 f"Data types:\n{df.dtypes.to_string()}\n\n"
-                f"Sample records:\n{df.head(3).to_string(index=False)}"
+                f"Sample records:\n"
+                f"{df.head(3).to_string(index=False)}"
             )
-
-            return context
 
         except Exception as error:
             return f"Unable to read input data: {error}"
 
-    # ------------------------------------------------------------------
+    # ==============================================================
     # FILE PREVIEW
-    # ------------------------------------------------------------------
+    # ==============================================================
 
     def preview_file(
         self,
@@ -239,29 +604,31 @@ class ETLTools:
         rows: int = 5,
         columns: list[str] | None = None,
     ) -> str:
-        """
-        Return a bounded preview of a project file without modifying it.
-        """
+        """Return a bounded preview of a project data file."""
 
         try:
-            if not isinstance(rows, int) or isinstance(rows, bool):
-                raise ValueError("rows must be an integer.")
-
-            if rows < 1 or rows > 20:
-                raise ValueError("rows must be between 1 and 20.")
+            if (
+                not isinstance(rows, int)
+                or isinstance(rows, bool)
+                or not 1 <= rows <= self.MAX_PREVIEW_ROWS
+            ):
+                raise ValueError(
+                    f"rows must be between 1 and {self.MAX_PREVIEW_ROWS}."
+                )
 
             df = self._read_dataframe(file_path)
 
             if columns:
                 missing_columns = [
-                    column for column in columns
+                    column
+                    for column in columns
                     if column not in df.columns
                 ]
 
                 if missing_columns:
                     raise ValueError(
-                        f"Unknown column(s): {', '.join(missing_columns)}. "
-                        f"Available columns: {', '.join(map(str, df.columns))}"
+                        "Unknown columns: "
+                        + ", ".join(missing_columns)
                     )
 
                 df = df.loc[:, columns]
@@ -279,25 +646,21 @@ class ETLTools:
         except Exception as error:
             return f"Unable to preview file: {error}"
 
-    # ------------------------------------------------------------------
+    # ==============================================================
     # VALIDATED PANDAS TRANSFORMATIONS
-    # ------------------------------------------------------------------
+    # ==============================================================
 
     def _apply_transformation(
         self,
         df: pd.DataFrame,
         instructions: dict[str, Any],
     ) -> pd.DataFrame:
-        """
-        Apply only predefined and validated Pandas operations.
-
-        Supported operations:
-        filter, select_columns, drop_columns, rename_columns,
-        sort, drop_duplicates, fill_null.
-        """
+        """Apply only predefined and validated Pandas transformations."""
 
         if not isinstance(instructions, dict):
-            raise ValueError("Transformation instructions must be a JSON object.")
+            raise ValueError(
+                "Transformation instructions must be a JSON object."
+            )
 
         operation = instructions.get("operation")
 
@@ -435,9 +798,9 @@ class ETLTools:
 
         return df
 
-    # ------------------------------------------------------------------
-    # TRANSFORM AND LOAD
-    # ------------------------------------------------------------------
+    # ==============================================================
+    # TRANSFORM AND LOAD TO FILE
+    # ==============================================================
 
     def transform_load(
         self,
@@ -446,15 +809,12 @@ class ETLTools:
         output_format: str,
         instructions: dict[str, Any],
     ) -> str:
-        """
-        Read input data, apply validated transformations, and save the result.
-        """
+        """Read, transform and save a dataset."""
 
         try:
             output_format = self._validate_format(output_format)
 
             df = self._read_dataframe(input_file_path)
-
             original_rows = len(df)
 
             transformed_df = self._apply_transformation(
@@ -469,29 +829,28 @@ class ETLTools:
                 filename="transformed_data",
             )
 
+            relative_path = file_path.relative_to(
+                self.project_root
+            ).as_posix()
+
             return (
                 "Transformation completed successfully.\n"
                 f"Original rows: {original_rows}\n"
                 f"Transformed rows: {len(transformed_df)}\n"
                 f"Columns: {len(transformed_df.columns)}\n"
-                f"Saved file: {file_path}"
+                f"Saved file: {relative_path}"
             )
 
         except Exception as error:
+            logger.exception("Data transformation failed")
             return f"Transformation failed: {error}"
 
-
-    # ------------------------------------------------------------------
+    # ==============================================================
     # LIST GENERATED FILES
-    # ------------------------------------------------------------------
+    # ==============================================================
 
     def list_generated_files(self) -> str:
-        """
-        List generated CSV files from the permitted ETL output folders.
-
-        Only files inside data/extract and data/transform are listed.
-        Symbolic links are skipped to prevent exposing unrelated files.
-        """
+        """List generated CSV files in approved ETL output folders."""
 
         generated_files = []
 
@@ -502,6 +861,7 @@ class ETLTools:
 
         try:
             for folder_name in allowed_folders:
+
                 expected_folder = self.project_root / folder_name
 
                 if expected_folder.is_symlink():
@@ -513,6 +873,7 @@ class ETLTools:
                     continue
 
                 for file_path in sorted(folder.iterdir()):
+
                     if file_path.suffix.lower() != ".csv":
                         continue
 
@@ -527,16 +888,14 @@ class ETLTools:
                     if not resolved_file.is_file():
                         continue
 
-                    generated_files.append(
-                        {
-                            "filename": resolved_file.name,
-                            "folder": folder_name,
-                            "path": resolved_file.relative_to(
-                                self.project_root
-                            ).as_posix(),
-                            "size_bytes": resolved_file.stat().st_size,
-                        }
-                    )
+                    generated_files.append({
+                        "filename": resolved_file.name,
+                        "folder": folder_name,
+                        "path": resolved_file.relative_to(
+                            self.project_root
+                        ).as_posix(),
+                        "size_bytes": resolved_file.stat().st_size,
+                    })
 
             if not generated_files:
                 return "No generated CSV files were found."
@@ -550,21 +909,30 @@ class ETLTools:
             )
 
         except (OSError, ValueError) as error:
+            logger.exception("Unable to list generated files")
             return f"Unable to list generated files: {error}"
 
 
-# ----------------------------------------------------------------------
+# ==============================================================
 # LOCAL TEST
-# ----------------------------------------------------------------------
+# ==============================================================
 
 if __name__ == "__main__":
 
     etl = ETLTools()
 
-    result = etl.extract_load(
-        url="https://pokeapi.co/api/v2/pokemon",
+    print("\nSUPABASE DATABASE EXTRACTION")
+    print("-" * 50)
+
+    result = etl.extract_database_to_file(
+        table_name="rides",
+        schema_name="public",
+        limit=100,
+        order_by="ride_id",
+        ascending=True,
         output_folder="data/extract",
-        format="csv",
+        output_format="csv",
+        filename="database_extract",
     )
 
     print(result)
