@@ -72,6 +72,31 @@ def get_final_etl_response(messages: list) -> str:
     return "The ETL agent completed without returning a final response."
 
 
+def get_etl_metadata(messages: list) -> dict:
+    """Retrieve metadata from the final ETL assistant message."""
+
+    for message in reversed(messages):
+
+        if not isinstance(message, AIMessage):
+            continue
+
+        if not isinstance(message.content, str):
+            continue
+
+        if not message.content.strip():
+            continue
+
+        if getattr(message, "tool_calls", None):
+            continue
+
+        if message.additional_kwargs.get("tool_calls"):
+            continue
+
+        return message.additional_kwargs or {}
+
+    return {}
+
+
 def build_execution_trace(route: str) -> list:
     """Build a structured record of the agent workflow."""
 
@@ -89,7 +114,10 @@ def build_execution_trace(route: str) -> list:
         {
             "step": 2,
             "agent": "Router",
-            "action": f"Classified the request and selected the {route.upper()} route.",
+            "action": (
+                f"Classified the request and selected "
+                f"the {route.upper()} route."
+            ),
             "status": "completed",
         },
         {
@@ -105,7 +133,10 @@ def build_execution_trace(route: str) -> list:
         {
             "step": 4,
             "agent": "Main Data Agent",
-            "action": "Received the specialist's result and prepared the final response.",
+            "action": (
+                "Received the specialist's result and prepared "
+                "the final response."
+            ),
             "status": "completed",
         },
     ]
@@ -169,7 +200,7 @@ def router_node(state: DataAgentSchema):
 
 
 def etl_node(state: DataAgentSchema):
-    """Execute the ETL Analyst agent."""
+    """Execute the ETL Analyst agent and preserve its metadata."""
 
     user_message = get_user_message(state)
 
@@ -189,14 +220,23 @@ def etl_node(state: DataAgentSchema):
         generated_messages
     )
 
+    etl_metadata = get_etl_metadata(
+        generated_messages
+    )
+
     trace = build_execution_trace("etl")
+
+    data_source = etl_metadata.get(
+        "data_source",
+        "Unknown",
+    )
 
     assistant_message = AIMessage(
         content=final_response,
         additional_kwargs={
             "selected_agent": "ETL Analyst",
             "agent_trace": trace,
-            "data_source": "User-provided file or external data source",
+            "data_source": data_source,
         },
     )
 
@@ -264,7 +304,6 @@ def sql_node(state: DataAgentSchema):
             ),
         }
 
-    # Attach execution trace to the final response.
     metadata.update({
         "selected_agent": "SQL Analyst",
         "agent_trace": build_execution_trace("sql"),
@@ -344,6 +383,10 @@ if __name__ == "__main__":
             "and save the results as a CSV file "
             "in data/extract/."
         ),
+        (
+            "Extract the first 100 records from the rides "
+            "table in Supabase PostgreSQL and save them as CSV."
+        ),
     ]
 
     for query in test_queries:
@@ -397,6 +440,7 @@ if __name__ == "__main__":
                 if route == "SQL":
 
                     print("\nSQL METADATA:")
+
                     for key in [
                         "generated_sql_query",
                         "is_safe",

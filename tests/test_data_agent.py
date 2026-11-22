@@ -3,7 +3,12 @@ import importlib
 from types import SimpleNamespace
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+)
 
 
 data_agent_module = importlib.import_module("agents.data_agent")
@@ -28,6 +33,7 @@ def sample_state():
 # ---------------------------------------------------------------------------
 
 def test_get_user_message_returns_latest_user_message():
+
     state = SimpleNamespace(
         messages=[
             HumanMessage(content="First question"),
@@ -42,6 +48,7 @@ def test_get_user_message_returns_latest_user_message():
 
 
 def test_get_user_message_rejects_empty_messages():
+
     state = SimpleNamespace(messages=[])
 
     with pytest.raises(ValueError, match="No messages found"):
@@ -49,6 +56,7 @@ def test_get_user_message_rejects_empty_messages():
 
 
 def test_get_user_message_rejects_missing_human_message():
+
     state = SimpleNamespace(
         messages=[
             AIMessage(content="Assistant response")
@@ -64,6 +72,7 @@ def test_get_user_message_rejects_missing_human_message():
 # ---------------------------------------------------------------------------
 
 def test_get_final_etl_response_returns_final_answer():
+
     messages = [
         AIMessage(content="Intermediate response"),
         AIMessage(content="Final ETL result"),
@@ -75,6 +84,7 @@ def test_get_final_etl_response_returns_final_answer():
 
 
 def test_get_final_etl_response_ignores_empty_messages():
+
     messages = [
         AIMessage(content=""),
         AIMessage(content="   "),
@@ -87,6 +97,7 @@ def test_get_final_etl_response_ignores_empty_messages():
 
 
 def test_get_final_etl_response_ignores_tool_call_messages():
+
     messages = [
         AIMessage(
             content="Intermediate tool response",
@@ -105,6 +116,7 @@ def test_get_final_etl_response_ignores_tool_call_messages():
 
 
 def test_get_final_etl_response_handles_no_final_response():
+
     messages = [
         HumanMessage(content="Extract data"),
         AIMessage(content=""),
@@ -118,10 +130,106 @@ def test_get_final_etl_response_handles_no_final_response():
 
 
 # ---------------------------------------------------------------------------
+# get_etl_metadata()
+# ---------------------------------------------------------------------------
+
+def test_get_etl_metadata_returns_final_message_metadata():
+
+    messages = [
+        AIMessage(
+            content="Intermediate response",
+            additional_kwargs={
+                "data_source": "Unknown"
+            },
+        ),
+        AIMessage(
+            content="Extraction completed.",
+            additional_kwargs={
+                "data_source": "Supabase PostgreSQL"
+            },
+        ),
+    ]
+
+    result = data_agent_module.get_etl_metadata(messages)
+
+    assert result["data_source"] == "Supabase PostgreSQL"
+
+
+def test_get_etl_metadata_ignores_empty_messages():
+
+    messages = [
+        AIMessage(
+            content="",
+            additional_kwargs={
+                "data_source": "Supabase PostgreSQL"
+            },
+        ),
+        AIMessage(
+            content="Valid response",
+            additional_kwargs={
+                "data_source": "External API"
+            },
+        ),
+    ]
+
+    result = data_agent_module.get_etl_metadata(messages)
+
+    assert result["data_source"] == "External API"
+
+
+def test_get_etl_metadata_ignores_tool_call_messages():
+
+    messages = [
+        AIMessage(
+            content="Intermediate response",
+            additional_kwargs={
+                "tool_calls": [
+                    {"id": "test-call"}
+                ],
+                "data_source": "Unknown",
+            },
+        ),
+        AIMessage(
+            content="Final response",
+            additional_kwargs={
+                "data_source": "Project dataset/file"
+            },
+        ),
+    ]
+
+    result = data_agent_module.get_etl_metadata(messages)
+
+    assert result["data_source"] == "Project dataset/file"
+
+
+def test_get_etl_metadata_handles_missing_metadata():
+
+    messages = [
+        AIMessage(content="Final response")
+    ]
+
+    result = data_agent_module.get_etl_metadata(messages)
+
+    assert result == {}
+
+
+def test_get_etl_metadata_handles_no_final_message():
+
+    messages = [
+        HumanMessage(content="Extract data")
+    ]
+
+    result = data_agent_module.get_etl_metadata(messages)
+
+    assert result == {}
+
+
+# ---------------------------------------------------------------------------
 # build_execution_trace()
 # ---------------------------------------------------------------------------
 
 def test_sql_execution_trace():
+
     trace = data_agent_module.build_execution_trace("sql")
 
     assert len(trace) == 4
@@ -130,10 +238,14 @@ def test_sql_execution_trace():
     assert trace[2]["agent"] == "SQL Analyst"
     assert trace[3]["agent"] == "Main Data Agent"
 
-    assert all(step["status"] == "completed" for step in trace)
+    assert all(
+        step["status"] == "completed"
+        for step in trace
+    )
 
 
 def test_etl_execution_trace():
+
     trace = data_agent_module.build_execution_trace("etl")
 
     assert len(trace) == 4
@@ -142,7 +254,10 @@ def test_etl_execution_trace():
     assert trace[2]["agent"] == "ETL Analyst"
     assert trace[3]["agent"] == "Main Data Agent"
 
-    assert all(step["status"] == "completed" for step in trace)
+    assert all(
+        step["status"] == "completed"
+        for step in trace
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -155,14 +270,14 @@ def test_router_node_returns_valid_route(
     monkeypatch,
     route,
 ):
+
     def mock_invoke(messages):
+
         assert isinstance(messages[0], SystemMessage)
         assert isinstance(messages[1], HumanMessage)
 
         return SimpleNamespace(answer=route.upper())
 
-    # Replace the module-level router instead of modifying
-    # the LangChain RunnableSequence's invoke method.
     monkeypatch.setattr(
         data_agent_module,
         "llm_router",
@@ -178,6 +293,7 @@ def test_router_node_rejects_invalid_route(
     sample_state,
     monkeypatch,
 ):
+
     monkeypatch.setattr(
         data_agent_module,
         "llm_router",
@@ -192,9 +308,8 @@ def test_router_node_rejects_invalid_route(
         data_agent_module.router_node(sample_state)
 
 
-def test_router_node_rejects_empty_user_messages(
-    monkeypatch,
-):
+def test_router_node_rejects_empty_user_messages(monkeypatch):
+
     state = SimpleNamespace(messages=[])
 
     result = SimpleNamespace(answer="sql")
@@ -228,6 +343,7 @@ def test_route_edge_selects_correct_node(
     route,
     expected_node,
 ):
+
     state = SimpleNamespace(route_response=route)
 
     result = data_agent_module.route_edge(state)
@@ -236,6 +352,7 @@ def test_route_edge_selects_correct_node(
 
 
 def test_route_edge_rejects_unsupported_route():
+
     state = SimpleNamespace(route_response="unknown")
 
     with pytest.raises(
@@ -253,6 +370,7 @@ def test_etl_node_returns_formatted_assistant_message(
     sample_state,
     monkeypatch,
 ):
+
     mock_response = {
         "messages": [
             AIMessage(content="ETL processing completed.")
@@ -276,16 +394,57 @@ def test_etl_node_returns_formatted_assistant_message(
     assert isinstance(message, AIMessage)
     assert message.content == "ETL processing completed."
     assert message.additional_kwargs["selected_agent"] == "ETL Analyst"
-    assert message.additional_kwargs["data_source"] == (
-        "User-provided file or external data source"
-    )
+    assert message.additional_kwargs["data_source"] == "Unknown"
     assert len(message.additional_kwargs["agent_trace"]) == 4
+
+
+@pytest.mark.parametrize(
+    "data_source",
+    [
+        "Supabase PostgreSQL",
+        "External API",
+        "Project dataset/file",
+        "Project files",
+    ],
+)
+def test_etl_node_preserves_data_source_metadata(
+    sample_state,
+    monkeypatch,
+    data_source,
+):
+
+    mock_response = {
+        "messages": [
+            AIMessage(
+                content="ETL processing completed.",
+                additional_kwargs={
+                    "data_source": data_source
+                },
+            )
+        ]
+    }
+
+    monkeypatch.setattr(
+        data_agent_module,
+        "etl_analyst",
+        SimpleNamespace(
+            invoke=lambda inputs: mock_response
+        ),
+    )
+
+    result = data_agent_module.etl_node(sample_state)
+
+    message = result["messages"][0]
+
+    assert message.additional_kwargs["data_source"] == data_source
+    assert message.additional_kwargs["selected_agent"] == "ETL Analyst"
 
 
 def test_etl_node_handles_missing_final_response(
     sample_state,
     monkeypatch,
 ):
+
     mock_response = {
         "messages": [
             AIMessage(content="")
@@ -306,11 +465,14 @@ def test_etl_node_handles_missing_final_response(
         "The ETL agent completed without returning a final response."
     )
 
+    assert result["messages"][0].additional_kwargs["data_source"] == "Unknown"
+
 
 def test_etl_node_handles_direct_ai_message_response(
     sample_state,
     monkeypatch,
 ):
+
     mock_response = AIMessage(
         content="Direct ETL response"
     )
@@ -326,9 +488,12 @@ def test_etl_node_handles_direct_ai_message_response(
     result = data_agent_module.etl_node(sample_state)
 
     assert result["messages"][0].content == "Direct ETL response"
+
     assert result["messages"][0].additional_kwargs["selected_agent"] == (
         "ETL Analyst"
     )
+
+    assert result["messages"][0].additional_kwargs["data_source"] == "Unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +504,7 @@ def test_sql_node_handles_dictionary_response(
     sample_state,
     monkeypatch,
 ):
+
     mock_response = {
         "final_answer": "There are five top cities.",
         "generated_sql_query": "SELECT city FROM users LIMIT 5",
@@ -362,9 +528,11 @@ def test_sql_node_handles_dictionary_response(
     assert isinstance(message, AIMessage)
     assert message.content == "There are five top cities."
     assert message.additional_kwargs["selected_agent"] == "SQL Analyst"
+
     assert message.additional_kwargs["generated_sql_query"] == (
         "SELECT city FROM users LIMIT 5"
     )
+
     assert message.additional_kwargs["is_safe"] == "Yes"
 
 
@@ -372,6 +540,7 @@ def test_sql_node_handles_object_response(
     sample_state,
     monkeypatch,
 ):
+
     mock_response = SimpleNamespace(
         final_answer="SQL execution completed.",
         generated_sql_query="SELECT COUNT(*) FROM users LIMIT 10",
@@ -401,6 +570,7 @@ def test_sql_node_handles_missing_final_answer(
     sample_state,
     monkeypatch,
 ):
+
     mock_response = {
         "final_answer": "",
         "generated_sql_query": "",
@@ -428,6 +598,7 @@ def test_sql_node_preserves_sql_execution_metadata(
     sample_state,
     monkeypatch,
 ):
+
     mock_response = {
         "final_answer": "Query completed.",
         "generated_sql_query": "SELECT * FROM users LIMIT 10",
@@ -453,11 +624,14 @@ def test_sql_node_preserves_sql_execution_metadata(
     assert metadata["generated_sql_query"] == (
         "SELECT * FROM users LIMIT 10"
     )
+
     assert metadata["is_safe"] == "Yes"
     assert metadata["comments"] == "Validated successfully."
+
     assert metadata["sql_query_execution_result"] == (
         '{"status": "success", "data": []}'
     )
+
     assert metadata["data_source"] == "Supabase PostgreSQL"
     assert len(metadata["agent_trace"]) == 4
 
@@ -467,5 +641,6 @@ def test_sql_node_preserves_sql_execution_metadata(
 # ---------------------------------------------------------------------------
 
 def test_data_agent_graph_is_compiled():
+
     assert data_agent_module.data_agent is not None
     assert callable(data_agent_module.data_agent.invoke)
