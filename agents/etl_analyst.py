@@ -100,6 +100,33 @@ def extract_database_tool(
 
 
 @tool
+def load_database_tool(
+    input_file_path: str,
+    table_name: str,
+    schema_name: str = "public",
+    if_exists: Literal["append", "replace"] = "append",
+    confirm_replace: bool = False,
+) -> str:
+    """Load a dataset into an existing PostgreSQL table.
+
+    Args:
+        input_file_path: Project-relative CSV, JSON, or Parquet file.
+        table_name: Existing PostgreSQL destination table.
+        schema_name: PostgreSQL schema, defaults to public.
+        if_exists: append or replace.
+        confirm_replace: Explicit authorization required for replace.
+    """
+    etl = ETLTools()
+    return etl.load_dataframe_to_database(
+        input_file_path=input_file_path,
+        table_name=table_name,
+        schema_name=schema_name,
+        if_exists=if_exists,
+        confirm_replace=confirm_replace,
+    )
+
+
+@tool
 def transform_load_tool(
     input_file_path: str,
     output_folder: str = "data/transform",
@@ -220,6 +247,7 @@ def list_generated_files_tool() -> str:
 tools = [
     extract_load_tool,
     extract_database_tool,
+    load_database_tool,
     transform_load_tool,
     preview_file_tool,
     list_generated_files_tool,
@@ -239,6 +267,7 @@ llm_with_tools = llm.bind_tools(tools)
 
 TOOL_DATA_SOURCES = {
     "extract_database_tool": "Supabase PostgreSQL",
+    "load_database_tool": "Supabase PostgreSQL",
     "extract_load_tool": "External API",
     "transform_load_tool": "Project dataset/file",
     "preview_file_tool": "Project dataset/file",
@@ -281,6 +310,9 @@ AVAILABLE TOOLS:
 5. list_generated_files_tool
    List generated files in supported ETL directories.
 
+6. load_database_tool
+   Load a CSV, JSON, or Parquet dataset into an existing Supabase PostgreSQL table.
+
 
 DATABASE EXTRACTION:
 
@@ -291,6 +323,18 @@ DATABASE EXTRACTION:
 - Default format is CSV.
 - Never invent database tables or columns.
 - Database extraction must remain read-only.
+
+
+DATABASE LOADING:
+
+- Use load_database_tool for PostgreSQL loading requests.
+- Use the exact source file path and destination table supplied by the user.
+- Default schema is public and default loading mode is append.
+- Never create or drop database tables.
+- Never use replace unless the user explicitly authorizes deletion of existing rows.
+- Set confirm_replace=True only after explicit user authorization.
+- Do not retry a failed load automatically.
+- Report the actual tool result; never claim success unless the tool confirms it.
 
 
 API EXTRACTION:
