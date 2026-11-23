@@ -55,7 +55,7 @@ Users submit a request through the React interface. A FastAPI backend invokes a 
 
 | Resource | URL |
 |---|---|
-| React frontend | https://agentic-data-intelligence-platform-1.onrender.com/ |
+| Stremlit frontend | https://agentic-data-intelligence-platform-1.onrender.com/ |
 | FastAPI backend | https://agentic-data-intelligence-platform.onrender.com |
 | Backend health check | https://agentic-data-intelligence-platform.onrender.com/health |
 | Source code | https://github.com/rushikeshraghatate90/Agentic-Data-Intelligence-Platform |
@@ -80,7 +80,7 @@ Users submit a request through the React interface. A FastAPI backend invokes a 
 
 ## System Architecture
 
-![Agentic Data Intelligence Platform — complete system architecture](docs/architecture.png)
+<img width="1774" height="887" alt="Architecture" src="https://github.com/user-attachments/assets/26991969-2e41-4bdf-a38e-fa35ee36602d" />
 
 ### Request lifecycle
 
